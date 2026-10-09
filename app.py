@@ -3,140 +3,154 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-import pandas as pd
 import requests
 import streamlit as st
 
-# -----------------------------
-# PAGE SETTINGS
-# -----------------------------
+# ==========================================
+# MEME RADAR AI - SOLANA DISCOVERY SCANNER
+# ==========================================
+
 st.set_page_config(
     page_title="Meme Radar AI",
-    page_icon="🛰️",
+    page_icon="🚀",
     layout="wide",
 )
 
 API = "https://api.dexscreener.com"
-MAX_TOKENS = 12
-REQUEST_TIMEOUT = 8
+TIMEOUT = 8
+HEADERS = {"User-Agent": "MemeRadarAI/2.0"}
 
 
-# -----------------------------
-# API HELPERS
-# -----------------------------
-def fetch_json(url):
-    response = requests.get(url, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    return response.json()
+# ==========================================
+# HELPERS
+# ==========================================
 
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_profiles():
-    data = fetch_json(f"{API}/token-profiles/latest/v1")
-
-    if not isinstance(data, list):
-        return []
-
-    profiles = []
-    seen = set()
-
-    for item in data:
-        if item.get("chainId") != "solana":
-            continue
-
-        address = item.get("tokenAddress")
-
-        if not address or address in seen:
-            continue
-
-        seen.add(address)
-        profiles.append(item)
-
-        if len(profiles) >= MAX_TOKENS:
-            break
-
-    return profiles
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_pairs(address):
-    data = fetch_json(f"{API}/token-pairs/v1/solana/{address}")
-    return data if isinstance(data, list) else []
+def get_json(url):
+    """Fetch JSON with a timeout so requests do not hang forever."""
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()
+    except (requests.RequestException, ValueError):
+        return None
 
 
 def number(value, default=0.0):
     try:
-        result = float(value)
-        if pd.notna(result):
-            return result
+        return float(value or 0)
     except (TypeError, ValueError):
-        pass
-
-    return default
+        return default
 
 
-# -----------------------------
-# TOKEN SCORING
-# -----------------------------
-def score_token(liquidity, volume, change, buys, sells, age_hours):
-    score = 0
-
-    # Liquidity
-    if liquidity >= 5_000:
-        score += 15
-    if liquidity >= 20_000:
-        score += 10
-
-    # Trading volume
-    if volume >= 5_000:
-        score += 10
-    if volume >= 25_000:
-        score += 10
-
-    # Buy activity
-    total = buys + sells
-    if total > 0:
-        buy_ratio = buys / total
-
-        if buy_ratio >= 0.55:
-            score += 15
-        if buy_ratio >= 0.65:
-            score += 10
-
-    # Recent pair creation
-    if age_hours is not None and 0 <= age_hours <= 24:
-        score += 10
-
-    # Price movement
-    if 0 < change <= 20:
-        score += 10
-    elif 20 < change <= 60:
-        score += 15
-    elif change > 60:
-        score += 5
-
-    # Risk penalties
-    if liquidity < 2_000:
-        score -= 25
-    if volume <= 0:
-        score -= 10
-    if change < -20:
-        score -= 10
-
-    return max(0, min(100, score))
+def money(value):
+    value = number(value)
+    if value >= 1_000_000_000:
+        return f"${value / 1_000_000_000:.2f}B"
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"${value / 1_000:.1f}K"
+    return f"${value:.2f}"
 
 
-# -----------------------------
-# FETCH ONE TOKEN
-# -----------------------------
-def analyze_token(profile):
-    address = profile["tokenAddress"]
-    pairs = get_pairs(address)
+def age_label(hours):
+    if hours is None:
+        return "Unknown"
+    if hours < 1:
+        return f"{int(hours * 60)} min"
+    if hours < 24:
+        return f"{hours:.1f} hr"
+    return f"{hours / 24:.1f} days"
+
+
+# ==========================================
+# DISCOVER TOKEN CANDIDATES
+# ==========================================
+
+def discover_candidates():
+    """
+    Discover candidates from recent profiles and boost feeds.
+    These feeds are not a complete list of every Solana launch.
+    """
+    endpoints = [
+        (
+            f"{API}/token-profiles/latest/v1",
+            "New profile",
+        ),
+        (
+            f"{API}/token-boosts/latest/v1",
+            "Recent boost",
+        ),
+        (
+            f"{API}/token-boosts/top/v1",
+            "Top boost",
+        ),
+    ]
+
+    candidates = {}
+
+    for url, source in endpoints:
+        data = get_json(url)
+
+        if not isinstance(data, list):
+            continue
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            if item.get("chainId") != "solana":
+                continue
+
+            address = item.get("tokenAddress")
+            if not address:
+                continue
+
+            if address not in candidates:
+                candidates[address] = {
+                    "address": address,
+                    "sources": set(),
+                    "boosted": False,
+                }
+
+            candidates[address]["sources"].add(source)
+
+            if "boost" in source.lower():
+                candidates[address]["boosted"] = True
+
+    for item in candidates.values():
+        item["sources"] = ", ".join(sorted(item["sources"]))
+
+    return list(candidates.values())
+
+
+# ==========================================
+# LOAD MARKET DATA
+# ==========================================
+
+def get_token_pair(candidate):
+    address = candidate["address"]
+    url = f"{API}/token-pairs/v1/solana/{address}"
+    data = get_json(url)
+
+    if not isinstance(data, list):
+        return None
+
+    pairs = [
+        pair for pair in data
+        if isinstance(pair, dict)
+        and pair.get("chainId") == "solana"
+        and (pair.get("baseToken") or {}).get("address") == address
+    ]
 
     if not pairs:
         return None
 
-    # Select the pair with the highest reported liquidity.
+    # Prefer the pool with the most reported liquidity.
     pair = max(
         pairs,
         key=lambda p: number(
@@ -144,321 +158,458 @@ def analyze_token(profile):
         ),
     )
 
-    base = pair.get("baseToken") or {}
-    liquidity = number(
-        (pair.get("liquidity") or {}).get("usd")
+    return candidate, pair
+
+
+# ==========================================
+# SCORING
+# ==========================================
+
+def analyze_token(candidate, pair):
+    token = pair.get("baseToken") or {}
+    liquidity = number((pair.get("liquidity") or {}).get("usd"))
+
+    volume = pair.get("volume") or {}
+    volume_5m = number(volume.get("m5"))
+    volume_1h = number(volume.get("h1"))
+    volume_6h = number(volume.get("h6"))
+    volume_24h = number(volume.get("h24"))
+
+    txns = pair.get("txns") or {}
+    tx_5m = txns.get("m5") or {}
+    tx_1h = txns.get("h1") or {}
+    tx_6h = txns.get("h6") or {}
+    tx_24h = txns.get("h24") or {}
+
+    buys_1h = number(tx_1h.get("buys"))
+    sells_1h = number(tx_1h.get("sells"))
+    buys_5m = number(tx_5m.get("buys"))
+    sells_5m = number(tx_5m.get("sells"))
+
+    trades_1h = buys_1h + sells_1h
+    trades_6h = (
+        number(tx_6h.get("buys"))
+        + number(tx_6h.get("sells"))
     )
-    volume = number(
-        (pair.get("volume") or {}).get("h24")
-    )
-    change = number(
-        (pair.get("priceChange") or {}).get("h24")
+    trades_24h = (
+        number(tx_24h.get("buys"))
+        + number(tx_24h.get("sells"))
     )
 
-    transactions = (
-        (pair.get("txns") or {}).get("h24") or {}
-    )
-
-    buys = int(number(transactions.get("buys")))
-    sells = int(number(transactions.get("sells")))
-
-    created = pair.get("pairCreatedAt")
+    created_ms = number(pair.get("pairCreatedAt"))
     age_hours = None
 
-    if created:
+    if created_ms > 0:
         age_hours = max(
             0,
-            (time.time() * 1000 - number(created)) / 3_600_000,
+            (time.time() * 1000 - created_ms) / 3_600_000,
         )
 
-    score = score_token(
-        liquidity,
-        volume,
-        change,
-        buys,
-        sells,
-        age_hours,
-    )
+    # EARLY SCORE: max 100
+    # Rewards recent pools and usable liquidity.
+    early = 0
+
+    if age_hours is not None:
+        if age_hours <= 1:
+            early += 45
+        elif age_hours <= 3:
+            early += 40
+        elif age_hours <= 6:
+            early += 34
+        elif age_hours <= 12:
+            early += 27
+        elif age_hours <= 24:
+            early += 20
+        elif age_hours <= 72:
+            early += 10
+        elif age_hours <= 168:
+            early += 5
+
+    if liquidity >= 50_000:
+        early += 40
+    elif liquidity >= 20_000:
+        early += 35
+    elif liquidity >= 10_000:
+        early += 30
+    elif liquidity >= 5_000:
+        early += 22
+    elif liquidity >= 2_000:
+        early += 12
+    elif liquidity >= 500:
+        early += 5
+
+    if trades_1h >= 20:
+        early += 15
+    elif trades_1h >= 5:
+        early += 10
+    elif trades_1h > 0:
+        early += 5
+
+    early = min(100, early)
+
+    # MOMENTUM SCORE: max 100
+    # Rewards current activity and transaction balance.
+    momentum = 0
+
+    if volume_1h >= 100_000:
+        momentum += 35
+    elif volume_1h >= 25_000:
+        momentum += 30
+    elif volume_1h >= 10_000:
+        momentum += 25
+    elif volume_1h >= 2_500:
+        momentum += 18
+    elif volume_1h >= 500:
+        momentum += 10
+    elif volume_1h > 0:
+        momentum += 4
+
+    if trades_1h >= 100:
+        momentum += 25
+    elif trades_1h >= 40:
+        momentum += 20
+    elif trades_1h >= 15:
+        momentum += 15
+    elif trades_1h >= 5:
+        momentum += 9
+    elif trades_1h > 0:
+        momentum += 4
+
+    # Positive buy/sell balance is one signal, not proof of demand.
+    if trades_1h > 0:
+        buy_ratio = buys_1h / trades_1h
+        if buy_ratio >= 0.65:
+            momentum += 20
+        elif buy_ratio >= 0.55:
+            momentum += 15
+        elif buy_ratio >= 0.45:
+            momentum += 10
+        else:
+            momentum += 3
+
+    # Compare hourly activity to longer-window averages.
+    if volume_6h > 0 and volume_1h > (volume_6h / 6) * 1.5:
+        momentum += 10
+    elif volume_24h > 0 and volume_1h > (volume_24h / 24):
+        momentum += 5
+
+    if volume_5m > 0 and (
+        volume_1h > 0
+        and volume_5m > volume_1h / 12
+    ):
+        momentum += 10
+
+    momentum = min(100, momentum)
+
+    # COMBINED SCORE: early discovery + momentum.
+    # Neither score is a prediction of future returns.
+    combined = round(early * 0.45 + momentum * 0.55)
+
+    # Basic warning flags for manual investigation.
+    warnings = []
+
+    if liquidity < 5_000:
+        warnings.append("Low liquidity")
+
+    if volume_1h == 0:
+        warnings.append("No reported 1h volume")
+
+    if trades_1h == 0:
+        warnings.append("No reported 1h trades")
+    elif sells_1h > buys_1h:
+        warnings.append("More sells than buys (1h)")
+
+    if age_hours is None:
+        warnings.append("Pool age unknown")
+
+    if candidate["boosted"]:
+        warnings.append("Paid boost feed")
+
+    if number(pair.get("fdv")) > 0 and liquidity > 0:
+        fdv = number(pair.get("fdv"))
+        if fdv / liquidity > 1000:
+            warnings.append("FDV very high vs liquidity")
 
     return {
-        "Token": base.get("name") or "Unknown",
-        "Symbol": base.get("symbol") or "?",
-        "Price USD": number(pair.get("priceUsd")),
-        "Market Cap USD": number(
-            pair.get("marketCap") or pair.get("fdv")
+        "Name": token.get("name") or "Unknown",
+        "Symbol": token.get("symbol") or "?",
+        "Age (hours)": age_hours,
+        "Age": age_label(age_hours),
+        "Early score": early,
+        "Momentum score": momentum,
+        "Combined score": combined,
+        "Liquidity": liquidity,
+        "Volume 5m": volume_5m,
+        "Volume 1h": volume_1h,
+        "Volume 6h": volume_6h,
+        "Volume 24h": volume_24h,
+        "Buys 1h": int(buys_1h),
+        "Sells 1h": int(sells_1h),
+        "Trades 6h": int(trades_6h),
+        "Trades 24h": int(trades_24h),
+        "Market cap": number(pair.get("marketCap")),
+        "FDV": number(pair.get("fdv")),
+        "Sources": candidate["sources"],
+        "Warnings": ", ".join(warnings) or "No basic flags",
+        "Address": candidate["address"],
+        "Pair URL": pair.get("url") or (
+            "https://dexscreener.com/solana/"
+            + candidate["address"]
         ),
-        "Liquidity USD": liquidity,
-        "Volume 24h USD": volume,
-        "Change 24h %": change,
-        "Buys": buys,
-        "Sells": sells,
-        "Age Hours": round(age_hours, 1)
-        if age_hours is not None else None,
-        "Score": score,
-        "Pair URL": pair.get("url", ""),
-        "Address": address,
+        "Boosted": candidate["boosted"],
     }
 
 
-# -----------------------------
-# SCANNER
-# -----------------------------
-def scan_tokens():
-    profiles = get_profiles()
+# ==========================================
+# RUN A SCAN
+# ==========================================
 
-    if not profiles:
-        return [], 0
+def scan_tokens(limit):
+    candidates = discover_candidates()
+
+    # Scan newest discovered candidates first.
+    candidates = candidates[:limit]
 
     results = []
     errors = 0
 
-    progress = st.progress(0, text="Scanning Solana tokens...")
+    # Concurrent requests reduce waiting time.
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [
+            executor.submit(get_token_pair, candidate)
+            for candidate in candidates
+        ]
 
-    # Run a few requests at the same time to reduce waiting.
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        tasks = {
-            executor.submit(analyze_token, profile): profile
-            for profile in profiles
-        }
-
-        completed = 0
-
-        for task in as_completed(tasks):
-            completed += 1
-
+        for future in as_completed(futures):
             try:
-                row = task.result()
-                if row:
-                    results.append(row)
+                result = future.result()
+
+                if result is None:
+                    errors += 1
+                    continue
+
+                candidate, pair = result
+                row = analyze_token(candidate, pair)
+                results.append(row)
+
             except Exception:
                 errors += 1
 
-            progress.progress(
-                completed / len(tasks),
-                text=f"Checked {completed} of {len(tasks)} tokens",
-            )
-
-    progress.empty()
-    return results, errors
+    return results, errors, len(candidates)
 
 
-# -----------------------------
-# WEBSITE
-# -----------------------------
-st.title("🛰️ Meme Radar AI")
-st.caption("Solana token discovery and momentum scanner")
+# ==========================================
+# DASHBOARD
+# ==========================================
 
-st.warning(
-    "Scores use experimental rules, not predictive AI. "
-    "Market data might be incomplete or manipulated. "
-    "A high score does not mean a token is safe or profitable."
+st.title("🚀 Meme Radar AI")
+st.caption(
+    "Solana early launches + momentum tracking | "
+    "Market data powered by DexScreener"
 )
 
 with st.sidebar:
     st.header("Scanner settings")
 
+    scan_limit = st.slider(
+        "Candidates per scan",
+        min_value=5,
+        max_value=30,
+        value=15,
+        step=5,
+    )
+
+    max_age = st.slider(
+        "Maximum pool age (hours)",
+        min_value=1,
+        max_value=720,
+        value=168,
+        step=1,
+    )
+
     min_liquidity = st.number_input(
         "Minimum liquidity ($)",
         min_value=0,
-        value=5_000,
-        step=1_000,
+        max_value=1_000_000,
+        value=500,
+        step=500,
     )
 
-    min_volume = st.number_input(
-        "Minimum 24h volume ($)",
+    min_score = st.slider(
+        "Minimum combined score",
         min_value=0,
-        value=5_000,
-        step=1_000,
+        max_value=100,
+        value=0,
     )
 
-    max_age = st.number_input(
-        "Maximum pair age (hours)",
-        min_value=1,
-        value=72,
-        step=12,
+    sort_choice = st.selectbox(
+        "Rank watchlist by",
+        [
+            "Combined score",
+            "Early score",
+            "Momentum score",
+            "Volume 1h",
+        ],
     )
 
-    refresh = st.button(
-        "Refresh market data",
+if "scan_rows" not in st.session_state:
+    st.session_state["scan_rows"] = []
+    st.session_state["scan_time"] = None
+    st.session_state["scan_errors"] = 0
+    st.session_state["scan_count"] = 0
+
+scan_col, info_col = st.columns([1, 3])
+
+with scan_col:
+    scan_clicked = st.button(
+        "🔎 Scan tokens",
+        type="primary",
         use_container_width=True,
     )
 
-if refresh:
-    get_profiles.clear()
-    get_pairs.clear()
-    st.session_state.pop("scan_rows", None)
+with info_col:
+    st.write(
+        "Scan recent discovery feeds, inspect Solana pools, "
+        "and rank candidates by launch age and market activity."
+    )
 
-if "scan_rows" not in st.session_state:
-    try:
-        with st.spinner("Connecting to market data..."):
-            rows, errors = scan_tokens()
+if scan_clicked:
+    with st.spinner(
+        "Checking discovery feeds and token markets..."
+    ):
+        rows, errors, checked = scan_tokens(scan_limit)
 
         st.session_state["scan_rows"] = rows
         st.session_state["scan_errors"] = errors
-
-    except requests.RequestException as exc:
-        st.error(
-            "Couldn't reach DEX Screener. Check your connection "
-            "and try again."
-        )
-        st.caption(f"Technical details: {exc}")
-        st.stop()
+        st.session_state["scan_count"] = checked
+        st.session_state["scan_time"] = datetime.now(
+            timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 rows = st.session_state["scan_rows"]
-errors = st.session_state.get("scan_errors", 0)
+
+if st.session_state["scan_time"]:
+    st.caption(
+        f"Last scan: {st.session_state['scan_time']} | "
+        f"Candidates checked: {st.session_state['scan_count']} | "
+        f"Unavailable: {st.session_state['scan_errors']}"
+    )
 
 if not rows:
-    st.warning(
-        "No token pairs loaded. Try refreshing in a minute. "
-        "The public API might be temporarily unavailable."
+    st.info(
+        "Your scanner is ready. Select 'Scan tokens' to "
+        "load recent discoveries and market activity."
     )
     st.stop()
 
-df = pd.DataFrame(rows)
+# Filters
+filtered = []
 
-filtered = df[
-    (df["Liquidity USD"] >= min_liquidity)
-    & (df["Volume 24h USD"] >= min_volume)
-    & (
-        df["Age Hours"].isna()
-        | (df["Age Hours"] <= max_age)
-    )
-].copy()
+for row in rows:
+    age = row["Age (hours)"]
 
-filtered = filtered.sort_values(
-    ["Score", "Volume 24h USD"],
-    ascending=False,
-).reset_index(drop=True)
+    if age is None or age > max_age:
+        continue
+
+    if row["Liquidity"] < min_liquidity:
+        continue
+
+    if row["Combined score"] < min_score:
+        continue
+
+    filtered.append(row)
+
+sort_key = {
+    "Combined score": "Combined score",
+    "Early score": "Early score",
+    "Momentum score": "Momentum score",
+    "Volume 1h": "Volume 1h",
+}[sort_choice]
+
+filtered.sort(
+    key=lambda row: row[sort_key],
+    reverse=True,
+)
 
 # Summary metrics
-a, b, c, d = st.columns(4)
+c1, c2, c3, c4 = st.columns(4)
 
-a.metric("Tokens loaded", len(df))
-b.metric("Passed filters", len(filtered))
-c.metric(
-    "Top score",
-    int(filtered["Score"].max()) if not filtered.empty else "None",
+c1.metric("Matching tokens", len(filtered))
+c2.metric(
+    "Top combined score",
+    max(
+        [row["Combined score"] for row in filtered],
+        default=0,
+    ),
 )
-d.metric("Request errors", errors)
-
-# Main results
-st.subheader("Early Momentum Watchlist")
-
-if filtered.empty:
-    st.info(
-        "No tokens meet your current filters. "
-        "Lower the minimum liquidity or volume."
-    )
-else:
-    display = filtered.rename(
-        columns={
-            "Price USD": "Price ($)",
-            "Market Cap USD": "Market Cap ($)",
-            "Liquidity USD": "Liquidity ($)",
-            "Volume 24h USD": "Volume 24h ($)",
-            "Change 24h %": "Change 24h (%)",
-            "Age Hours": "Pair Age (hours)",
-        }
-    )
-
-    st.dataframe(
-        display[
-            [
-                "Token",
-                "Symbol",
-                "Score",
-                "Price ($)",
-                "Market Cap ($)",
-                "Liquidity ($)",
-                "Volume 24h ($)",
-                "Change 24h (%)",
-                "Pair Age (hours)",
-                "Buys",
-                "Sells",
-                "Pair URL",
-                "Address",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Pair URL": st.column_config.LinkColumn(
-                "DEX Screener"
-            ),
-            "Price ($)": st.column_config.NumberColumn(
-                format="%.10f"
-            ),
-            "Market Cap ($)": st.column_config.NumberColumn(
-                format="$%.0f"
-            ),
-            "Liquidity ($)": st.column_config.NumberColumn(
-                format="$%.0f"
-            ),
-            "Volume 24h ($)": st.column_config.NumberColumn(
-                format="$%.0f"
-            ),
-            "Change 24h (%)": st.column_config.NumberColumn(
-                format="%.2f%%"
-            ),
-        },
-    )
-
-    st.download_button(
-        "Download watchlist CSV",
-        data=filtered.to_csv(index=False).encode("utf-8"),
-        file_name="meme_radar_watchlist.csv",
-        mime="text/csv",
-    )
-
-# Token details
-st.subheader("Token Details")
-
-selected = st.selectbox(
-    "Choose a token",
-    options=range(len(df)),
-    format_func=lambda idx: (
-        f"{df.iloc[idx]['Symbol']} | "
-        f"{df.iloc[idx]['Token']} | "
-        f"Score {df.iloc[idx]['Score']}"
+c3.metric(
+    "High momentum (70+)",
+    sum(row["Momentum score"] >= 70 for row in filtered),
+)
+c4.metric(
+    "Very new pools (under 6h)",
+    sum(
+        row["Age (hours)"] < 6
+        for row in filtered
     ),
 )
 
-token = df.iloc[selected]
+st.subheader("Ranked watchlist")
 
-left, right = st.columns(2)
-
-with left:
-    st.write(f"**Name:** {token['Token']}")
-    st.write(f"**Symbol:** {token['Symbol']}")
-    st.write(f"**Price:** ${token['Price USD']:.10f}")
-    st.write(f"**Liquidity:** ${token['Liquidity USD']:,.0f}")
-    st.write(f"**24h volume:** ${token['Volume 24h USD']:,.0f}")
-
-with right:
-    st.write(f"**Score:** {token['Score']}/100")
-    st.write(f"**24h change:** {token['Change 24h %']:.2f}%")
-    st.write(f"**Buys:** {token['Buys']}")
-    st.write(f"**Sells:** {token['Sells']}")
-    st.write(f"**Pair age:** {token['Age Hours']} hours")
-
-st.code(token["Address"], language=None)
-
-if token["Pair URL"]:
-    st.link_button(
-        "Open on DEX Screener",
-        token["Pair URL"],
+if not filtered:
+    st.warning(
+        "No tokens match your current filters. "
+        "Lower minimum liquidity or score, or increase "
+        "maximum pool age, then scan again."
     )
+    st.stop()
 
 st.caption(
-    "Last scan: "
-    + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    "Scores are heuristic rankings based on available market data. "
+    "They do not establish safety, predict returns, or guarantee "
+    "that a token is genuinely new."
 )
 
+for index, row in enumerate(filtered, start=1):
+    with st.container(border=True):
+        left, middle, right = st.columns([3, 2, 1])
+
+        with left:
+            st.markdown(
+                f"### #{index} {row['Name']} "
+                f"(${row['Symbol']})"
+            )
+            st.caption(
+                f"Combined: {row['Combined score']}/100 | "
+                f"Early: {row['Early score']}/100 | "
+                f"Momentum: {row['Momentum score']}/100"
+            )
+            st.caption(
+                f"Pool age: {row['Age']} | "
+                f"Buys/sells in 1h: "
+                f"{row['Buys 1h']}/{row['Sells 1h']}"
+            )
+
+        with middle:
+            st.write(f"Liquidity: {money(row['Liquidity'])}")
+            st.write(f"Volume (1h): {money(row['Volume 1h'])}")
+            st.write(f"Volume (24h): {money(row['Volume 24h'])}")
+            st.write(f"Market cap: {money(row['Market cap'])}")
+
+        with right:
+            st.link_button(
+                "View token",
+                row["Pair URL"],
+                use_container_width=True,
+            )
+
+        st.caption(f"Discovery source: {row['Sources']}")
+        st.caption(f"Risk flags: {row['Warnings']}")
+        st.code(row["Address"], language=None)
+
+st.divider()
 st.caption(
-    "This scanner samples recent token profiles. "
-    "It does not detect every new launch or guarantee early entry."
+    "Research tool only. Meme coins are highly speculative. "
+    "Low liquidity, manipulated volume, paid promotion, and "
+    "concentrated ownership can create substantial risk."
 )
-
-
-
-
