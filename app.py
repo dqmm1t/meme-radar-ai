@@ -93,7 +93,11 @@ def score_token(liquidity, volume, change, buys, sells, age_hours):
 
 
 def build_rows():
+    try:
     profiles = get_profiles()
+except requests.RequestException as exc:
+    st.error(f"Unable to load token profiles: {exc}")
+    st.stop()
     rows = []
     errors = 0
 
