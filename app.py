@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 
 # ==========================================
-# MEME RADAR AI - SOLANA DISCOVERY SCANNER
+# MEME RADAR AI - DISCOVERY + SECURITY
 # ==========================================
 
 st.set_page_config(
@@ -16,9 +16,10 @@ st.set_page_config(
     layout="wide",
 )
 
-API = "https://api.dexscreener.com"
+DEX_API = "https://api.dexscreener.com"
+RUGCHECK_API = "https://api.rugcheck.xyz"
 TIMEOUT = 8
-HEADERS = {"User-Agent": "MemeRadarAI/2.0"}
+HEADERS = {"User-Agent": "MemeRadarAI/3.0"}
 
 
 # ==========================================
@@ -26,7 +27,6 @@ HEADERS = {"User-Agent": "MemeRadarAI/2.0"}
 # ==========================================
 
 def get_json(url):
-    """Fetch JSON with a timeout so requests do not hang forever."""
     try:
         response = requests.get(
             url,
@@ -48,12 +48,14 @@ def number(value, default=0.0):
 
 def money(value):
     value = number(value)
+
     if value >= 1_000_000_000:
         return f"${value / 1_000_000_000:.2f}B"
     if value >= 1_000_000:
         return f"${value / 1_000_000:.2f}M"
     if value >= 1_000:
         return f"${value / 1_000:.1f}K"
+
     return f"${value:.2f}"
 
 
@@ -68,25 +70,21 @@ def age_label(hours):
 
 
 # ==========================================
-# DISCOVER TOKEN CANDIDATES
+# DISCOVER CANDIDATES
 # ==========================================
 
 def discover_candidates():
-    """
-    Discover candidates from recent profiles and boost feeds.
-    These feeds are not a complete list of every Solana launch.
-    """
     endpoints = [
         (
-            f"{API}/token-profiles/latest/v1",
+            f"{DEX_API}/token-profiles/latest/v1",
             "New profile",
         ),
         (
-            f"{API}/token-boosts/latest/v1",
+            f"{DEX_API}/token-boosts/latest/v1",
             "Recent boost",
         ),
         (
-            f"{API}/token-boosts/top/v1",
+            f"{DEX_API}/token-boosts/top/v1",
             "Top boost",
         ),
     ]
@@ -129,12 +127,11 @@ def discover_candidates():
 
 
 # ==========================================
-# LOAD MARKET DATA
+# MARKET DATA
 # ==========================================
 
-def get_token_pair(candidate):
-    address = candidate["address"]
-    url = f"{API}/token-pairs/v1/solana/{address}"
+def get_best_pair(address):
+    url = f"{DEX_API}/token-pairs/v1/solana/{address}"
     data = get_json(url)
 
     if not isinstance(data, list):
@@ -150,24 +147,198 @@ def get_token_pair(candidate):
     if not pairs:
         return None
 
-    # Prefer the pool with the most reported liquidity.
-    pair = max(
+    return max(
         pairs,
-        key=lambda p: number(
-            (p.get("liquidity") or {}).get("usd")
+        key=lambda pair: number(
+            (pair.get("liquidity") or {}).get("usd")
         ),
     )
 
-    return candidate, pair
+
+# ==========================================
+# RUGCHECK SECURITY REPORT
+# ==========================================
+
+def get_rugcheck_report(address):
+    """
+    Retrieve the third-party token report.
+
+    None means the report was unavailable. It does NOT
+    mean the token is safe.
+    """
+    url = f"{RUGCHECK_API}/v1/tokens/{address}/report"
+    data = get_json(url)
+
+    if not isinstance(data, dict):
+        return None
+
+    return data
+
+
+def get_report_risks(report):
+    """Extract reported risks without assuming every field exists."""
+    if not isinstance(report, dict):
+        return []
+
+    raw_risks = report.get("risks", [])
+
+    if not isinstance(raw_risks, list):
+        return []
+
+    found = []
+
+    for item in raw_risks:
+        if isinstance(item, dict):
+            name = (
+                item.get("name")
+                or item.get("description")
+                or "Unspecified risk"
+            )
+            level = (
+                item.get("level")
+                or item.get("severity")
+                or "Unspecified"
+            )
+            description = item.get("description") or name
+
+            found.append({
+                "name": str(name),
+                "level": str(level),
+                "description": str(description),
+            })
+
+        elif isinstance(item, str):
+            found.append({
+                "name": item,
+                "level": "Unspecified",
+                "description": item,
+            })
+
+    return found
+
+
+def get_risk_rating(report):
+    """
+    Give a cautious summary of the provider's reported findings.
+    Missing reports never receive a safe rating.
+    """
+    if not isinstance(report, dict):
+        return "UNKNOWN", "Security report unavailable"
+
+    risks = get_report_risks(report)
+
+    levels = [
+        risk["level"].lower()
+        for risk in risks
+    ]
+
+    if any(
+        "critical" in level
+        for level in levels
+    ):
+        return "CRITICAL", "Critical risk reported"
+
+    if any(
+        "danger" in level or "high" in level
+        for level in levels
+    ):
+        return "HIGH", "High risk reported"
+
+    if any(
+        "medium" in level or "moderate" in level
+        for level in levels
+    ):
+        return "MODERATE", "Moderate risk reported"
+
+    if risks:
+        return "REVIEW", "Risk findings need review"
+
+    # An empty risk list is not proof of safety.
+    return "UNCONFIRMED", "No listed risks; safety unconfirmed"
+
+
+def report_score(report):
+    """Display a provider score as reported, without guessing its scale."""
+    if not isinstance(report, dict):
+        return "Unavailable"
+
+    for key in ("score_normalised", "scoreNormalized", "score"):
+        if report.get(key) is not None:
+            return str(report[key])
+
+    return "Not provided"
+
+
+def extract_authority(report, key):
+    """
+    Extract authority values only when their location is known.
+    Unknown stays unknown.
+    """
+    if not isinstance(report, dict):
+        return "Unknown"
+
+    possible_objects = [
+        report,
+        report.get("token"),
+        report.get("tokenMeta"),
+        report.get("token_metadata"),
+    ]
+
+    for obj in possible_objects:
+        if not isinstance(obj, dict):
+            continue
+
+        if key in obj:
+            value = obj[key]
+
+            if value is None or value == "":
+                return "Disabled / None reported"
+
+            return "Active"
+
+    return "Unknown"
+
+
+def holder_summary(report):
+    """
+    Use top-holder data only when present.
+    The report schema can vary; otherwise return Unknown.
+    """
+    if not isinstance(report, dict):
+        return "Unknown"
+
+    holders = report.get("topHolders")
+
+    if not isinstance(holders, list) or not holders:
+        return "Unknown"
+
+    percentages = []
+
+    for holder in holders[:10]:
+        if not isinstance(holder, dict):
+            continue
+
+        # Only use explicit percentage-like fields.
+        for key in ("pct", "percentage", "percent"):
+            if holder.get(key) is not None:
+                percentages.append(number(holder[key]))
+                break
+
+    if not percentages:
+        return "Holder data present; percentage unavailable"
+
+    return f"Top listed wallets: {sum(percentages):.1f}%"
 
 
 # ==========================================
-# SCORING
+# TOKEN SCORING
 # ==========================================
 
-def analyze_token(candidate, pair):
+def analyze_token(candidate, pair, report):
     token = pair.get("baseToken") or {}
-    liquidity = number((pair.get("liquidity") or {}).get("usd"))
+    liquidity = number(
+        (pair.get("liquidity") or {}).get("usd")
+    )
 
     volume = pair.get("volume") or {}
     volume_5m = number(volume.get("m5"))
@@ -183,10 +354,8 @@ def analyze_token(candidate, pair):
 
     buys_1h = number(tx_1h.get("buys"))
     sells_1h = number(tx_1h.get("sells"))
-    buys_5m = number(tx_5m.get("buys"))
-    sells_5m = number(tx_5m.get("sells"))
-
     trades_1h = buys_1h + sells_1h
+
     trades_6h = (
         number(tx_6h.get("buys"))
         + number(tx_6h.get("sells"))
@@ -205,8 +374,7 @@ def analyze_token(candidate, pair):
             (time.time() * 1000 - created_ms) / 3_600_000,
         )
 
-    # EARLY SCORE: max 100
-    # Rewards recent pools and usable liquidity.
+    # EARLY-LAUNCH SCORE
     early = 0
 
     if age_hours is not None:
@@ -247,8 +415,7 @@ def analyze_token(candidate, pair):
 
     early = min(100, early)
 
-    # MOMENTUM SCORE: max 100
-    # Rewards current activity and transaction balance.
+    # MOMENTUM SCORE
     momentum = 0
 
     if volume_1h >= 100_000:
@@ -275,9 +442,9 @@ def analyze_token(candidate, pair):
     elif trades_1h > 0:
         momentum += 4
 
-    # Positive buy/sell balance is one signal, not proof of demand.
     if trades_1h > 0:
         buy_ratio = buys_1h / trades_1h
+
         if buy_ratio >= 0.65:
             momentum += 20
         elif buy_ratio >= 0.55:
@@ -287,48 +454,65 @@ def analyze_token(candidate, pair):
         else:
             momentum += 3
 
-    # Compare hourly activity to longer-window averages.
     if volume_6h > 0 and volume_1h > (volume_6h / 6) * 1.5:
         momentum += 10
     elif volume_24h > 0 and volume_1h > (volume_24h / 24):
         momentum += 5
 
-    if volume_5m > 0 and (
-        volume_1h > 0
-        and volume_5m > volume_1h / 12
-    ):
-        momentum += 10
+    if volume_5m > 0 and volume_1h > 0:
+        if volume_5m > volume_1h / 12:
+            momentum += 10
 
     momentum = min(100, momentum)
 
-    # COMBINED SCORE: early discovery + momentum.
-    # Neither score is a prediction of future returns.
-    combined = round(early * 0.45 + momentum * 0.55)
+    combined = round(
+        early * 0.45 + momentum * 0.55
+    )
 
-    # Basic warning flags for manual investigation.
-    warnings = []
+    # BASIC MARKET FLAGS
+    market_flags = []
 
     if liquidity < 5_000:
-        warnings.append("Low liquidity")
+        market_flags.append("Low liquidity")
 
     if volume_1h == 0:
-        warnings.append("No reported 1h volume")
+        market_flags.append("No reported 1h volume")
 
     if trades_1h == 0:
-        warnings.append("No reported 1h trades")
+        market_flags.append("No reported 1h trades")
     elif sells_1h > buys_1h:
-        warnings.append("More sells than buys (1h)")
+        market_flags.append("More sells than buys (1h)")
 
     if age_hours is None:
-        warnings.append("Pool age unknown")
+        market_flags.append("Pool age unknown")
 
     if candidate["boosted"]:
-        warnings.append("Paid boost feed")
+        market_flags.append("Paid boost feed")
 
-    if number(pair.get("fdv")) > 0 and liquidity > 0:
-        fdv = number(pair.get("fdv"))
+    fdv = number(pair.get("fdv"))
+
+    if fdv > 0 and liquidity > 0:
         if fdv / liquidity > 1000:
-            warnings.append("FDV very high vs liquidity")
+            market_flags.append("FDV very high vs liquidity")
+
+    # SECURITY REPORT
+    rating, rating_description = get_risk_rating(report)
+    risks = get_report_risks(report)
+
+    risk_names = [
+        f"{risk['level']}: {risk['name']}"
+        for risk in risks
+    ]
+
+    security_flags = "; ".join(risk_names)
+
+    if not security_flags:
+        if report is None:
+            security_flags = "Unknown: report unavailable"
+        else:
+            security_flags = (
+                "No listed risks; not proof of safety"
+            )
 
     return {
         "Name": token.get("name") or "Unknown",
@@ -348,12 +532,24 @@ def analyze_token(candidate, pair):
         "Trades 6h": int(trades_6h),
         "Trades 24h": int(trades_24h),
         "Market cap": number(pair.get("marketCap")),
-        "FDV": number(pair.get("fdv")),
+        "FDV": fdv,
         "Sources": candidate["sources"],
-        "Warnings": ", ".join(warnings) or "No basic flags",
+        "Market flags": "; ".join(market_flags) or "No basic flags",
+        "Security rating": rating,
+        "Security summary": rating_description,
+        "RugCheck score": report_score(report),
+        "Security flags": security_flags,
+        "Mint authority": extract_authority(report, "mintAuthority"),
+        "Freeze authority": extract_authority(report, "freezeAuthority"),
+        "Holder summary": holder_summary(report),
+        "Security checked": report is not None,
         "Address": candidate["address"],
         "Pair URL": pair.get("url") or (
             "https://dexscreener.com/solana/"
+            + candidate["address"]
+        ),
+        "RugCheck URL": (
+            "https://rugcheck.xyz/tokens/"
             + candidate["address"]
         ),
         "Boosted": candidate["boosted"],
@@ -361,36 +557,44 @@ def analyze_token(candidate, pair):
 
 
 # ==========================================
-# RUN A SCAN
+# SCAN
 # ==========================================
 
-def scan_tokens(limit):
-    candidates = discover_candidates()
+def scan_one(candidate):
+    address = candidate["address"]
 
-    # Scan newest discovered candidates first.
-    candidates = candidates[:limit]
+    # Each token gets a market lookup and a security lookup.
+    pair = get_best_pair(address)
+
+    if pair is None:
+        return None
+
+    report = get_rugcheck_report(address)
+
+    return analyze_token(candidate, pair, report)
+
+
+def scan_tokens(limit):
+    candidates = discover_candidates()[:limit]
 
     results = []
     errors = 0
 
-    # Concurrent requests reduce waiting time.
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    # Keep concurrency limited to avoid excessive API requests.
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [
-            executor.submit(get_token_pair, candidate)
+            executor.submit(scan_one, candidate)
             for candidate in candidates
         ]
 
         for future in as_completed(futures):
             try:
-                result = future.result()
+                row = future.result()
 
-                if result is None:
+                if row is None:
                     errors += 1
-                    continue
-
-                candidate, pair = result
-                row = analyze_token(candidate, pair)
-                results.append(row)
+                else:
+                    results.append(row)
 
             except Exception:
                 errors += 1
@@ -404,8 +608,8 @@ def scan_tokens(limit):
 
 st.title("🚀 Meme Radar AI")
 st.caption(
-    "Solana early launches + momentum tracking | "
-    "Market data powered by DexScreener"
+    "Solana token discovery, momentum ranking, and "
+    "independent security reports"
 )
 
 with st.sidebar:
@@ -415,7 +619,7 @@ with st.sidebar:
         "Candidates per scan",
         min_value=5,
         max_value=30,
-        value=15,
+        value=10,
         step=5,
     )
 
@@ -424,7 +628,6 @@ with st.sidebar:
         min_value=1,
         max_value=720,
         value=168,
-        step=1,
     )
 
     min_liquidity = st.number_input(
@@ -469,13 +672,13 @@ with scan_col:
 
 with info_col:
     st.write(
-        "Scan recent discovery feeds, inspect Solana pools, "
-        "and rank candidates by launch age and market activity."
+        "Scan recent Solana discovery feeds, rank market activity, "
+        "and retrieve third-party risk reports."
     )
 
 if scan_clicked:
     with st.spinner(
-        "Checking discovery feeds and token markets..."
+        "Scanning markets and checking token security reports..."
     ):
         rows, errors, checked = scan_tokens(scan_limit)
 
@@ -492,17 +695,16 @@ if st.session_state["scan_time"]:
     st.caption(
         f"Last scan: {st.session_state['scan_time']} | "
         f"Candidates checked: {st.session_state['scan_count']} | "
-        f"Unavailable: {st.session_state['scan_errors']}"
+        f"Unavailable/error: {st.session_state['scan_errors']}"
     )
 
 if not rows:
     st.info(
-        "Your scanner is ready. Select 'Scan tokens' to "
-        "load recent discoveries and market activity."
+        "Your scanner is ready. Tap 'Scan tokens' to start."
     )
     st.stop()
 
-# Filters
+# FILTERS
 filtered = []
 
 for row in rows:
@@ -531,25 +733,22 @@ filtered.sort(
     reverse=True,
 )
 
-# Summary metrics
+# SUMMARY
 c1, c2, c3, c4 = st.columns(4)
 
 c1.metric("Matching tokens", len(filtered))
 c2.metric(
-    "Top combined score",
-    max(
-        [row["Combined score"] for row in filtered],
-        default=0,
-    ),
-)
-c3.metric(
     "High momentum (70+)",
     sum(row["Momentum score"] >= 70 for row in filtered),
 )
+c3.metric(
+    "Security reports available",
+    sum(row["Security checked"] for row in filtered),
+)
 c4.metric(
-    "Very new pools (under 6h)",
+    "Critical/high reports",
     sum(
-        row["Age (hours)"] < 6
+        row["Security rating"] in ("CRITICAL", "HIGH")
         for row in filtered
     ),
 )
@@ -558,16 +757,14 @@ st.subheader("Ranked watchlist")
 
 if not filtered:
     st.warning(
-        "No tokens match your current filters. "
-        "Lower minimum liquidity or score, or increase "
-        "maximum pool age, then scan again."
+        "No tokens match the filters. Lower the minimum liquidity "
+        "or score, or increase the maximum pool age."
     )
     st.stop()
 
 st.caption(
-    "Scores are heuristic rankings based on available market data. "
-    "They do not establish safety, predict returns, or guarantee "
-    "that a token is genuinely new."
+    "Market scores and security reports are separate. "
+    "Unknown means unverified, not safe."
 )
 
 for index, row in enumerate(filtered, start=1):
@@ -576,8 +773,7 @@ for index, row in enumerate(filtered, start=1):
 
         with left:
             st.markdown(
-                f"### #{index} {row['Name']} "
-                f"(${row['Symbol']})"
+                f"### #{index} {row['Name']} (${row['Symbol']})"
             )
             st.caption(
                 f"Combined: {row['Combined score']}/100 | "
@@ -586,7 +782,7 @@ for index, row in enumerate(filtered, start=1):
             )
             st.caption(
                 f"Pool age: {row['Age']} | "
-                f"Buys/sells in 1h: "
+                f"Buys/sells (1h): "
                 f"{row['Buys 1h']}/{row['Sells 1h']}"
             )
 
@@ -602,14 +798,45 @@ for index, row in enumerate(filtered, start=1):
                 row["Pair URL"],
                 use_container_width=True,
             )
+            st.link_button(
+                "RugCheck report",
+                row["RugCheck URL"],
+                use_container_width=True,
+            )
 
-        st.caption(f"Discovery source: {row['Sources']}")
-        st.caption(f"Risk flags: {row['Warnings']}")
-        st.code(row["Address"], language=None)
+        rating = row["Security rating"]
+
+        if rating == "CRITICAL":
+            st.error(f"SECURITY: {rating} - {row['Security summary']}")
+        elif rating == "HIGH":
+            st.error(f"SECURITY: {rating} - {row['Security summary']}")
+        elif rating == "MODERATE":
+            st.warning(f"SECURITY: {rating} - {row['Security summary']}")
+        elif rating == "REVIEW":
+            st.warning(f"SECURITY: REVIEW - {row['Security summary']}")
+        elif rating == "UNKNOWN":
+            st.warning("SECURITY: UNKNOWN - report unavailable")
+        else:
+            st.info(
+                f"SECURITY: {rating} - {row['Security summary']}"
+            )
+
+        with st.expander("Inspect security details"):
+            a, b, c = st.columns(3)
+
+            a.write(f"Provider score: {row['RugCheck score']}")
+            b.write(f"Mint authority: {row['Mint authority']}")
+            c.write(f"Freeze authority: {row['Freeze authority']}")
+
+            st.write(f"Holder concentration: {row['Holder summary']}")
+            st.write(f"Reported risks: {row['Security flags']}")
+            st.write(f"Market warnings: {row['Market flags']}")
+            st.write(f"Discovery source: {row['Sources']}")
+            st.code(row["Address"], language=None)
 
 st.divider()
 st.caption(
-    "Research tool only. Meme coins are highly speculative. "
-    "Low liquidity, manipulated volume, paid promotion, and "
-    "concentrated ownership can create substantial risk."
+    "Research tool only. Reports may be missing, delayed, or incomplete. "
+    "A clean report is not a guarantee against a rug pull. "
+    "Verify major findings independently before risking money."
 )
